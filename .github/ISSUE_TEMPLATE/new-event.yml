@@ -1,0 +1,79 @@
+name: 📅 Add an event
+description: Request that an event be listed on https://valkey.io/events/
+title: "[EVENT] <Event name>"
+labels: ["event"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to list a conference, meetup, or hackathon that features Valkey on the [events page](https://valkey.io/events/).
+
+        A maintainer reviews the request. When they close the issue as **completed**, a pull request that adds the event is opened automatically. Closing it as **not planned** declines the request.
+
+        Field headings are read by automation, so please leave them as they are.
+  - type: input
+    id: event-name
+    attributes:
+      label: Event name
+      description: The public name of the event, as it should appear on the calendar.
+      placeholder: KCD Lima 2026
+    validations:
+      required: true
+  - type: input
+    id: event-date
+    attributes:
+      label: Event date
+      description: The date the event starts, in YYYY-MM-DD format.
+      placeholder: "2026-07-18"
+    validations:
+      required: true
+  - type: dropdown
+    id: event-type
+    attributes:
+      label: Event type
+      description: Determines the color and badge used on the calendar.
+      options:
+        - Third-party event
+        - Meetup or hackathon
+        - Valkey event (organized by the Valkey project)
+      default: 0
+    validations:
+      required: true
+  - type: input
+    id: location
+    attributes:
+      label: Location
+      description: City and country, or a venue address. Use "Online" for virtual events.
+      placeholder: Lima, Peru
+    validations:
+      required: true
+  - type: input
+    id: location-url
+    attributes:
+      label: Location map URL
+      description: Optional. An https link to the venue on a map.
+      placeholder: https://www.google.com/maps/place/...
+    validations:
+      required: false
+  - type: input
+    id: event-url
+    attributes:
+      label: Event URL
+      description: The https page where attendees register or learn more. The calendar entry links here.
+      placeholder: https://example.com/my-event
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes for maintainers
+      description: Optional. How Valkey is featured (talk, booth, sponsor), or anything else reviewers should know. Not published.
+    validations:
+      required: false
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: The event is related to Valkey and I agree to follow the [Valkey Code of Conduct](https://valkey.io/code-of-conduct).
+          required: true

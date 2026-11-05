@@ -1,0 +1,192 @@
+name: Event issue to PR
+
+# When a maintainer approves an "Add an event" issue by closing it as completed,
+# open a pull request that adds the event to content/events.
+#
+# Maintainers can also run this workflow by hand for an issue, for example after
+# fixing a field that failed validation.
+
+on:
+  issues:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Number of the "Add an event" issue to turn into a pull request
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: event-issue-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+env:
+  EVENT_LABEL: event
+
+jobs:
+  create-pr:
+    # Closing as "not planned" declines the request, so only "completed" proceeds.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.state_reason == 'completed' &&
+       contains(github.event.issue.labels.*.name, 'event'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          # workflow `permissions` only scopes GITHUB_TOKEN, not this token.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Load issue and check approver
+        id: issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DISPATCH_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        with:
+          github-token: ${{ steps.generate-token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+
+            let issue = context.payload.issue;
+            if (context.eventName === 'workflow_dispatch') {
+              const number = process.env.DISPATCH_ISSUE_NUMBER.trim();
+              if (!/^[1-9][0-9]*$/.test(number)) {
+                core.setFailed(`"${number}" is not an issue number.`);
+                return;
+              }
+              ({ data: issue } = await github.rest.issues.get({ owner, repo, issue_number: Number(number) }));
+              if (issue.pull_request) {
+                core.setFailed(`#${number} is a pull request, not an issue.`);
+                return;
+              }
+              if (!issue.labels.some(l => (typeof l === 'string' ? l : l.name) === process.env.EVENT_LABEL)) {
+                core.setFailed(`#${number} does not have the "${process.env.EVENT_LABEL}" label.`);
+                return;
+              }
+            }
+
+            // Issue authors can close their own issues, so closing alone is not approval.
+            const approver = context.actor;
+            const { data: level } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner, repo, username: approver,
+            });
+            const approved = ['admin', 'maintain', 'write'].includes(level.permission);
+
+            const bodyFile = path.join(process.env.RUNNER_TEMP, 'issue-body.md');
+            fs.writeFileSync(bodyFile, issue.body || '');
+
+            core.setOutput('number', String(issue.number));
+            core.setOutput('author', issue.user.login);
+            core.setOutput('body_file', bodyFile);
+            core.setOutput('approver', approver);
+            core.setOutput('approved', String(approved));
+
+            if (!approved) {
+              core.notice(`@${approver} has "${level.permission}" access; only maintainers can approve events.`);
+            }
+
+      - name: Explain that the closer is not a maintainer
+        if: steps.issue.outputs.approved == 'false'
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          APPROVER: ${{ steps.issue.outputs.approver }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body \
+            "This issue was closed by @$APPROVER, who is not a maintainer, so no pull request was created. A maintainer can reopen it and close it as completed to approve the event."
+
+      - name: Checkout
+        if: steps.issue.outputs.approved == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Generate event page
+        id: event
+        if: steps.issue.outputs.approved == 'true'
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_BODY_FILE: ${{ steps.issue.outputs.body_file }}
+        run: python3 build/event-from-issue.py
+
+      - name: Commit, push, and open pull request
+        id: pr
+        if: steps.issue.outputs.approved == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          APP_SLUG: ${{ steps.generate-token.outputs.app-slug }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_AUTHOR: ${{ steps.issue.outputs.author }}
+          APPROVER: ${{ steps.issue.outputs.approver }}
+          BRANCH: ${{ steps.event.outputs.branch }}
+          EVENT_PATH: ${{ steps.event.outputs.path }}
+          EVENT_TITLE: ${{ steps.event.outputs.title }}
+          EVENT_DATE: ${{ steps.event.outputs.date }}
+        run: |
+          set -euo pipefail
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+
+          git switch --create "$BRANCH"
+          git add -- "$EVENT_PATH"
+          git commit --signoff \
+            -m "Add event: $EVENT_TITLE" \
+            -m "Requested in #$ISSUE_NUMBER by @$ISSUE_AUTHOR and approved by @$APPROVER."
+
+          # The branch only ever holds generated content, so a re-run replaces it.
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+
+          pr_url=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
+            --json url --jq '.[0].url // empty')
+          if [[ -z "$pr_url" ]]; then
+            body_file="$RUNNER_TEMP/pr-body.md"
+            {
+              printf 'Adds **%s** (%s) to the [events page](https://valkey.io/events/).\n\n' "$EVENT_TITLE" "$EVENT_DATE"
+              printf -- '- Requested in #%s by @%s\n' "$ISSUE_NUMBER" "$ISSUE_AUTHOR"
+              printf -- '- Approved by @%s\n\n' "$APPROVER"
+              printf 'Generated by the %s workflow from the issue form fields. ' "\`$GITHUB_WORKFLOW\`"
+              printf 'Edit %s on this branch if anything needs adjusting before merge.\n' "\`$EVENT_PATH\`"
+            } > "$body_file"
+            pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --title "Add event: $EVENT_TITLE" --body-file "$body_file" --label "$EVENT_LABEL")
+          fi
+          echo "url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "Pull request: $pr_url" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Link pull request on the issue
+        if: steps.pr.outputs.url != ''
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body \
+            "Thanks! The event is ready for review in $PR_URL. It appears on https://valkey.io/events/ once that pull request merges."
+
+      - name: Report validation errors on the issue
+        if: failure() && steps.event.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ERRORS: ${{ steps.event.outputs.errors }}
+        run: |
+          body_file="$RUNNER_TEMP/errors.md"
+          {
+            printf 'The event could not be added because some fields need fixing:\n\n'
+            printf '%s\n\n' "${ERRORS:-- See the workflow log for details.}"
+            printf 'Edit the issue description, then a maintainer can re-run the **%s** workflow ' "$GITHUB_WORKFLOW"
+            printf 'from the Actions tab with issue number %s.\n\n' "\`$ISSUE_NUMBER\`"
+            printf 'Run log: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+          } > "$body_file"
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$body_file"
